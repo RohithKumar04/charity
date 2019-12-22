@@ -1,9 +1,11 @@
-from flask import Flask, request,jsonify, session,flash
-from datetime import datetime
+from flask import Flask,request,jsonify, session,flash
+import datetime
+from functools import wraps
 #from flask_pymongo import PyMongo
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
+import jwt
 
 load_dotenv()
 
@@ -18,82 +20,148 @@ ngo = db[str(os.getenv("ngo_table"))]
 
 required = ["FOOD", "DONATION","MATERIALS"]
 
+count = 0 #to count no of users
 
 def login_required(f):
-    def wraps(*args, **kwargs):
-        if "LoggedAdmin" in session:
-            return f(*args,**kwargs)
+    @wraps(f)
+    def decorator(*args, **kwargs):
+        if "token" in request.headers:
+            token = request.headers["token"]
+
+            if not token:
+                return jsonify({"message":"token is missing"})
+
+            try:
+                data = jwt.decode(token,app.config["SECRET_KEY"])
+            except:
+                return jsonify({"message":"invalid token"})
+            return f(data,*args,**kwargs)
         else:
             return jsonify({"message":"login required"})
-    return wraps
+    return decorator
 
 
 @app.route("/") # home page
 def home():
-    return "hello world"
+    return "hello world" 
 
-@app.route("/user", methods =["POST"]) #for user to create )
-def user():
-    if request.method == "POST":
-        db.user.insert_one({
-            "_id":request.json["EmailID"], #primary key
-            "FirstName":request.json["FirstName"],
-            "LastName":request.json["LastName"],
-            "Password":request.json["Password"],
-            "DOB":request.json["DOB"],
-            "PhoneNumber":request.json["PhoneNumber"],
-            "PANNumber": request.json["PANNumber"],
-            "Active":False,
-            "LastLogin": datetime.now(),
-            "IsAdmin": False
-        })
-        return jsonify({"message":"user created successfully"})
+@app.route("/user", methods =["POST"]) #create user )
+def create_user():
+    try: # catch duplicate error
+        if request.method == "POST":
+            db.user.insert_one({
+                "_id":request.json["EmailID"], #primary key
+                "FirstName":request.json["FirstName"],
+                "LastName":request.json["LastName"],
+                "CurrentPassword":request.json["CurrentPassword"],
+                "DOB":request.json["DOB"],
+                "PhoneNumber":request.json["PhoneNumber"],
+                "PANNumber": request.json["PANNumber"],
+                "Active":False,
+                "LastLogin":datetime.datetime.utcnow(),
+                "IsAdmin":False
+            })
+            return jsonify({"message":"user created successfully"})
+    except:
+        return jsonify({"message":"user already exist"})
 
 
-@app.route("/user/<id>", methods =["GET","DELETE"]) #for login
-def login(id):
-    CurrentUser = db.user.find_one({"_id":id})
+@app.route("/user",methods=["GET"])
+@login_required
+def AllUsers(admin):
+    if not admin["IsAdmin"]:
+        return jsonify({"message":"only accesalbe to admin"})
+
     if request.method == "GET":
-        if CurrentUser and request.json["Password"]== CurrentUser["Password"]:
-            session["LoggedUser"] = CurrentUser # tocheck and use the user in diff places
-            if CurrentUser["IsAdmin"] == True:
-                session["LoggedAdmin"] = CurrentUser # to check before making a user into admin
-            return jsonify({"message":"login succesfull"})
-        else:
-            return jsonify({"message":"invalid username and pwd"})
-    
-    elif request.method == "DELETE":
+        users = db.user.find()
+        user_data = []
+        for user in users:
+             user_data.append(user)
+        return jsonify({"users":user_data})
+    else:
+        return jsonify({"message":"not a valid request"})
+
+@app.route("/user/<id>", methods =["DELETE"]) #for deleting user
+@login_required
+def DeleteUser(admin,id):
+    if not admin["IsAdmin"]:
+        return jsonify({"message":"only accesalbe to admin"})
+
+    if request.method == "DELETE":
+        CurrentUser = db.user.find_one({"_id":id})
         if CurrentUser:
-            ngo.remove({"_id":id})
+            db.user.remove({"_id":id})
             return jsonify({"message":"succesfully removed"})
         else:
             return jsonify({"message":"invalid usernamee"})
 
+@app.route("/user/<userID>",methods = ["GET"]) #to obtain one user
+def oneUser(userID):
+    if request.method == "GET":
+        CurrentUser = db.user.find({"_id":userID})
+        display = []
+        for user in CurrentUser:
+            display.append(user)
+        return jsonify({"user":display})
+    return jsonify({"message":"not Valid User"})
+
+@app.route("/user", methods= ["PUT"]) #current pwd is mandatory for updating
+@login_required
+def UpdateUser(loggeduser):
+    if request.method == "PUT":
+        CurrentPassword = loggeduser["CurrentPassword"] #password from the token
+        if CurrentPassword == request.json["CurrentPassword"]:
+            db.user.update({"_id":loggeduser["Username"]},{"$set":{
+            "FirstName":request.json["FirstName"],
+            "LastName":request.json["LastName"],
+            "CurrentPassword":request.json["NewPassword"], #updating new password
+            "PhoneNumber":request.json["PhoneNumber"]
+            }})
+            return jsonify({"message": "successfully updated"})
+    return jsonify({"message":"not a valid request"})
+
+
+@app.route("/login") #to login
+def userlogin():
+    CurrentUser = db.user.find_one({"_id":request.json["EmailID"]})
+    if CurrentUser and CurrentUser["CurrentPassword"] == request.json["CurrentPassword"]:
+        token = jwt.encode({"Username":CurrentUser["_id"],"CurrentPassword":CurrentUser["CurrentPassword"],"FirstName":CurrentUser["FirstName"],"PhoneNumber":CurrentUser["PhoneNumber"],"IsAdmin":CurrentUser["IsAdmin"],"exp":datetime.datetime.utcnow()+datetime.timedelta(minutes=40)},app.config["SECRET_KEY"])
+
+        session["loggedin"]= CurrentUser
+
+        db.user.update({"_id":CurrentUser["_id"]},{"$set":{"LastLogin":datetime.datetime.utcnow()}})
+        return jsonify({"token": token.decode("UTF-8")})
+    else:
+        return jsonify({"message":"invalid user"})
 
 @app.route("/make_admin/<UserID>",methods=["GET","PUT"])
 @login_required
-def make_admin(UserID):
-    CurrentUser = db.user.find_one({"_id":UserID})
-    if CurrentUser and CurrentUser != session["LoggedAdmin"]:
-        CurrentAdmin = session["LoggedAdmin"]
-        db.user.update({"_id":UserID},{"$set":{"IsAdmin":True},"$push":{"AddedBy":CurrentAdmin}})
+def make_admin(admin,UserID):
+    if admin["IsAdmin"] and admin["Username"] != UserID: 
+        CurrentUser = db.user.find_one({"_id":UserID})
+        db.user.update({"_id":UserID},{"$set":{"IsAdmin":True},"$push":{"AddedBy":{"Name":admin["FirstName"],"EmailID":admin["Username"],"PhoneNumber":admin["PhoneNumber"]}}})
         return jsonify({"message":"you made user admin"})
     else:
         return jsonify({"message":"sorry! WRONG USEER  "})
 
+@app.route("/logout") #can be used for both user and ngo
+def logout():
+    if "loggedin" in session:
+        session.pop("loggedin",None)
+        if "token" in request.headers:
+            request.headers["token"] = None
+        return jsonify({"message":"successfully logged out"})
+    else:
+        return jsonify({"message":"redirect to login page"})
 
-@app.route("/transaction/<user_id>/<ngo_id>",methods = ["PUT"])
-def transaction(user_id,ngo_id):
-    pass
-
-@app.route("/ngo", methods =["POST","GET"])
-def ngo():
+@app.route("/ngo", methods =["POST"])
+def create_ngo():
     if request.method == "POST":
         db.ngo.insert_one({
             "_id":request.json["EmailID"],  #primary key
             "Approved":False,
             "FullName":request.json["FullName"],
-            "Password":request.json["Password"],
+            "CurrentPassword":request.json["CurrentPassword"],
             "BankDetails":{
                 "NameOncard":request.json["NameOnCard"],
                 "AccountNumber":request.json["AccountNumber"],
@@ -104,31 +172,76 @@ def ngo():
             "PhoneNumber":request.json["PhoneNumber"],                  #add location down
             "Description":[request.json["Type"],request.json["NoOfPeople"],"locationID",0,0],
                             #type of org       , no of people             ,loctionid, amt raised,likes
-            "DateJoined": datetime.now(),
+            "DateJoined": datetime.datetime.utcnow(),
             "DonatedList":[],
-            "Requirement": required[request.json["GetNumber"]], #1=food, 2=money, 3= materiaals  (refer line 15)
+            "Requirement": required[request.json["GetNumber"]] #1=food, 2=money, 3= materiaals  (refer line 15)
         })
         return jsonify({"message":"ngo created successfully"})
 
+@app.route("/ngo",methods=["GET"])
+@login_required
+def AllNGOs(admin):
+    if not admin["IsAdmin"]:
+        return jsonify({"message":"only accesalbe to admin"})
 
-
-@app.route("/ngo/<id>", methods =["GET","DELETE"])
-def login_ngo(id):
     if request.method == "GET":
-        CurrentNGO = db.ngo.find_one({"_id":id})
-        if CurrentNGO and request.json["Password"]== CurrentNGO["Password"]: #check for password 
-            return jsonify({"message":"logged in succesfully"})
-        else:
-            return jsonify({"message":"invalid username and pwd"})
-    
-    elif request.method == "DELETE":
-        CurrentNGO = db.ngo.find_one({"_id":id})
-        if CurrentNGO:
+        ngos = db.ngo.find()
+        ngo_data = []
+        for user in ngos:
+             ngo_data.append(user)
+        return jsonify(({"users":ngo_data}))
+    else:
+        return jsonify({"message":"not a valid request"})
+
+@app.route("/ngo/<id>", methods =["DELETE"]) #for deleting ngo
+@login_required
+def Deletengo(admin,id):
+    if not admin["IsAdmin"]:
+        return jsonify({"message":"only accesalbe to admin"})
+
+    if request.method == "DELETE":
+        Currentngo = db.ngo.find_one({"_id":id})
+        if Currentngo:
             ngo.remove({"_id":id})
             return jsonify({"message":"succesfully removed"})
         else:
             return jsonify({"message":"invalid usernamee"})
 
+@app.route("/ngo/<ngoID>",methods = ["GET"]) #to obtain one ngo
+def onengo(ngoID):
+    if request.method == "GET":
+        Currentngo = db.ngo.find_one({"_id":ngoID})
+        return jsonify({"message":Currentngo})
+    return jsonify({"message":"not Valid ngo"})
+
+@app.route("/ngo", methods= ["PUT"]) #current pwd is mandatory for updating
+@login_required
+def Updatengo(loggedngo):
+    if request.method == "PUT":
+        CurrentPassword = loggedngo["CurrentPassword"] #password from the token
+        if CurrentPassword == request.json["CurrentPassword"]:
+            db.ngo.update({"_id":loggedngo["Username"]},{"$set":{
+            "FullName":request.json["FullName"],
+            "Address":request.json["Address"],
+            "CurrentPassword":request.json["NewPassword"], #updating new password
+            "PhoneNumber":request.json["PhoneNumber"],
+            "Requirement": required[request.json["GetNumber"]],
+            "Description.1": request.json["NoOfPeople"] #refer line 15
+            }})
+            return jsonify({"message": "successfully updated"})
+    return jsonify({"message":"not a valid request"})
+
+@app.route("/loginNGO")
+def ngologin():
+    Currentngo = db.ngo.find_one({"_id":request.json["EmailID"]})
+    if Currentngo and Currentngo["CurrentPassword"] == request.json["CurrentPassword"]:
+        token = jwt.encode({"Username":Currentngo["_id"],"CurrentPassword":Currentngo["CurrentPassword"],"Address":Currentngo["Address"],"FullName":Currentngo["FullName"],"PhoneNumber":Currentngo["PhoneNumber"],"Requirement":Currentngo["Requirement"],"exp":datetime.datetime.utcnow()+datetime.timedelta(minutes=40)},app.config["SECRET_KEY"])
+
+        session["loggedin"]= Currentngo #for logging out
+
+        return jsonify({"token": token.decode("UTF-8")})
+    else:
+        return jsonify({"message":"invalid user"})
 
 
 
