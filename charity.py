@@ -2,25 +2,32 @@ from flask import Flask,request,jsonify, session,flash
 import datetime
 from functools import wraps
 #from flask_pymongo import PyMongo
-from pymongo import MongoClient
+import pymongo
 from dotenv import load_dotenv
 import os
-import jwt
+import jwt,json
+
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"]= os.getenv("secretKey")
-cluster = MongoClient("mongodb://localhost:27017/")
+cluster = pymongo.MongoClient("mongodb://localhost:27017/")
 db = cluster[str(os.getenv("dbname"))]
 
 user = db[str(os.getenv("user_table"))]
 transaction = db[str(os.getenv("transaction_table"))]
 ngo = db[str(os.getenv("ngo_table"))]
+location = db["Cities"]
 
 required = ["FOOD", "DONATION","MATERIALS"]
 
+
+with open("city.json","r") as city:
+   db.location.insert_many(json.load(city))
+
 count = 0 #to count no of users
+approval = []
 
 def login_required(f):
     @wraps(f)
@@ -38,12 +45,42 @@ def login_required(f):
             return f(data,*args,**kwargs)
         else:
             return jsonify({"message":"login required"})
+        
     return decorator
 
+@app.route("/user/<ngoID>/approval")
+@login_required
+def approval(admin,ngoID):
+    if not admin["IsAdmin"]:
+        return jsonify({"message":"only accesalbe to admin"}) 
+    
+    if request.json["approval"]:
+        db.ngo.update({"_id":ngoID},{"$set":{"Approved":True}})
+        return jsonify({"message":"approval granted"})
+    else: # disapproval
+        db.ngo.update({"_id":ngoID},{"$set":{"Approved":False}})
+        return jsonify({"message":"approval withdrawn"})
 
-@app.route("/") # home page
-def home():
-    return "hello world" 
+@app.route("/search") 
+def search():
+    q =request.args.get("q")
+    city =  request.args.get("city")
+    if q: #to search near by ngo with coordinates and name
+        result = db.ngo.find( {"$and":[{"FullName":{"$regex": q,"$options":'i'}},
+                        {"Location" :{"$near":{ "$geometry" :{"type":"Point","coordinates" : [request.json["long"] , request.json["latitude"]] } ,"$maxDistance" : 5000} } },
+                        {"City":city}]} )
+    else:
+        result = db.ngo.find( {"Location" :{"$near":{ "$geometry" :{"type":"Point", # search nearby ngos with coordinates
+                              "coordinates" : [ request.json["long"] , request.json["latitude"]] } ,
+                             "$maxDistance" : 500
+                      } } } )
+    #print(result)
+    user_data = []
+    for user in result:
+        if user["Approved"]: #to make only approved ngo visible to the users
+            user_data.append(user)
+    return jsonify({"users":user_data})
+    #return jsonify({"serach results": result}) 
 
 @app.route("/user", methods =["POST"]) #create user )
 def create_user():
@@ -57,11 +94,13 @@ def create_user():
                 "DOB":request.json["DOB"],
                 "PhoneNumber":request.json["PhoneNumber"],
                 "PANNumber": request.json["PANNumber"],
-                "Active":False,
+                "Active":True if count ==0 else False, # the first user created will be admin
                 "LastLogin":datetime.datetime.utcnow(),
                 "IsAdmin":False
             })
-            return jsonify({"message":"user created successfully"})
+            return jsonify({"message":"user created successfully"}
+            )
+        count +=1
     except:
         return jsonify({"message":"user already exist"})
 
@@ -129,7 +168,7 @@ def userlogin():
 
         session["loggedin"]= CurrentUser
 
-        db.user.update({"_id":CurrentUser["_id"]},{"$set":{"LastLogin":datetime.datetime.utcnow()}})
+        db.user.update({"_id":CurrentUser["_id"]},{"$set":{"LastLogin":datetime.datetime.utcnow(),"Active":True}})
         return jsonify({"token": token.decode("UTF-8")})
     else:
         return jsonify({"message":"invalid user"})
@@ -157,6 +196,7 @@ def logout():
 @app.route("/ngo", methods =["POST"])
 def create_ngo():
     if request.method == "POST":
+        city = db.location.find_one({"name":{"$regex":request.json["city"],"$options":"i"}})
         db.ngo.insert_one({
             "_id":request.json["EmailID"],  #primary key
             "Approved":False,
@@ -169,13 +209,21 @@ def create_ngo():
                 "PANNumber": request.json["PANNumber"]
             },
             "Address":request.json["Address"],
-            "PhoneNumber":request.json["PhoneNumber"],                  #add location down
-            "Description":[request.json["Type"],request.json["NoOfPeople"],"locationID",0,0],
+            "PhoneNumber":request.json.get("PhoneNumber"),                  #add location down
+            "Description":[request.json["Type"],request.json["NoOfPeople"],0,0],
                             #type of org       , no of people             ,loctionid, amt raised,likes
             "DateJoined": datetime.datetime.utcnow(),
             "DonatedList":[],
+            "City":city["name"],
+            "State":city["state"],
+            "Location":{"type":"Point",
+                 "coordinates":[request.json["Latitude"],request.json["Longitude"]]
+                 },
             "Requirement": required[request.json["GetNumber"]] #1=food, 2=money, 3= materiaals  (refer line 15)
         })
+        CurrentNGO = db.ngo.find_one({"_id":request.json["EmailID"]})
+        approval.append(CurrentNGO)
+        db.ngo.create_index([("Location", pymongo.GEOSPHERE)]) 
         return jsonify({"message":"ngo created successfully"})
 
 @app.route("/ngo",methods=["GET"])
@@ -188,7 +236,7 @@ def AllNGOs(admin):
         ngos = db.ngo.find()
         ngo_data = []
         for user in ngos:
-             ngo_data.append(user)
+            ngo_data.append(user)
         return jsonify(({"users":ngo_data}))
     else:
         return jsonify({"message":"not a valid request"})
@@ -242,6 +290,7 @@ def ngologin():
         return jsonify({"token": token.decode("UTF-8")})
     else:
         return jsonify({"message":"invalid user"})
+
 
 
 
