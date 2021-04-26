@@ -63,6 +63,7 @@ def approval(admin,ngoID):
         db.ngo.update({"_id":ngoID},{"$set":{"Approved":False}})
         return jsonify({"message":"approval withdrawn"})
 
+print("new commit")
 @app.route("/search") 
 def search():
     q =request.args.get("q")
