@@ -23,7 +23,6 @@ location = db["Cities"]
 required = ["FOOD", "DONATION","MATERIALS"]
 
 print("commit 1");
-print("commit 2");
 
 with open("city.json","r") as city:
    db.location.insert_many(json.load(city))
